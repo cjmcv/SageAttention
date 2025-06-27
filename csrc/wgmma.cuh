@@ -18,8 +18,16 @@
 #include <cuda.h>
 
 namespace wgmma{
+// <NT> 0x3FFFF是一个18位的掩码，其二进制表示为0011 1111 1111 1111 1111.
+// x&0x3FFFF，表示只有低18位的值被保留，其余位都被清零。然后>> 0x4表示右移4位。
 __device__ __forceinline__ uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
+// <NT> 生成smem矩阵描述符。smem描述符是一个64位的值，包含了矩阵在共享内存中的地址、维度和步长等信息。
+// 这种描述符通常用于与 Tensor Core 指令配合使用. 
+// stride表示矩阵的步长（一行的元素个数），T是元素数据类型。
+// ptr是smem中矩阵的起始地址，
+// __cvta_generic_to_shared将通用指针ptr转换为共享内存指针。
+// matrix_descriptor_encode将地址或其他信息编码为矩阵描述符的一部分。
 template <int stride, typename T>
 __device__ uint64_t make_smem_desc(T* ptr) {
     static_assert(stride == 32 || stride == 64 || stride == 128);
@@ -32,14 +40,22 @@ __device__ uint64_t make_smem_desc(T* ptr) {
     return desc;
 }
 
+// <NT> 同步一个warp内所有线程
 __device__ __forceinline__ void warpgroup_arrive() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
+// <NT> 将当前 warp group 中所有未提交的 wgmma.mma_async 操作打包成一个新的 wgmma-group.
+// 以便后续可以等待这些操作的完成. 一般会先执行该指令，后执行wgmma.wait_group.sync.aligned 进行等待。
 __device__ __forceinline__ void warpgroup_commit_batch() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
+// <NT> 使执行该指令的线程等待，直到最近的 wgmma-group 中未完成的操作数量不超过指定的参数 N。
+// 当参数 N 为 0 时，线程会等待所有先前提交的 wgmma-group 完成。通常与wgmma.commit_group.sync.aligned搭配使用。
+// 如不使用wgmma.commit_group.sync.aligned，直接调用该指令做wg的同步，会导致
+// 未定义行为(等待一个不存在的 wgmma-group)和性能问题（浪费时间等待一个空的或不存在的 wgmma-group）。
+// 所以应搭配上面的 commit_group 指令使用。
 template <int N>
 __device__ __forceinline__ void warpgroup_wait() {
     static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
@@ -210,6 +226,9 @@ __device__ __forceinline__ void wgmma_m64n128k32_f8f8f32(float d[][8], uint32_t 
             "n"(1), "n"(1));
 }
 
+// <NT> s8[64,32] * s8[32,128] = s32[64, 128] => 
+// 一个wg共4*32=128个线程，一个线程对应d[8,8]的输出，拼凑出完整的输出s32[64, 128].
+// BK是head_dim是64或128，也是blockTile计算中的K，对应取出的矩阵的stride将会是64或128.
 template<int ScaleD, int BK, typename T>
 __device__ void wgmma_m64n128k32_s8s8s32(int32_t d[][8], T* sA, T* sB) {
     uint64_t desc_a = make_smem_desc<BK>(&sA[0]);
@@ -275,6 +294,7 @@ __device__ __forceinline__ void wgmma_f16f16f32(float d[WGMMA_N/16][8], T* sA, T
     }
 }
 
+// <NT> 按WGMMA_N派发m64n128k32和m64n64k32的wgmma指令
 template<int WGMMA_N, int ScaleD, int BK, typename T>
 __device__ __forceinline__ void wgmma_s8s8s32(int32_t d[WGMMA_N/16][8], T* sA, T* sB) {
     static_assert(WGMMA_N == 128 || WGMMA_N == 64);

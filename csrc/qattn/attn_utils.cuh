@@ -392,10 +392,12 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1)); // 0 exchange with 1, 2 exchange with 3
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2)); // 0 exchange with 2, 1 exchange with 3
 
+      // <NT> 即第一步的最大值，对应fa3中的max_get_scale函数的row_max
       m[fq][k] = max(m[fq][k], m_temp);
 
       float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
 
+      // <NT> 即第二步的指数和，对应fa3中的max_get_scale函数的row_sum
       // update denominator
       d[fq][k] *= o_scale;
 
@@ -405,6 +407,7 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
         o_scale2 = __floats2half2_rn(o_scale, o_scale);
       }
 
+      // <NT> RO是PV结果的累加值，
       // update RO
 #pragma unroll
       for (uint32_t fv = 0; fv < num_tiles_v; fv++)

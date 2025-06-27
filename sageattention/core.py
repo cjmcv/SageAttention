@@ -59,6 +59,9 @@ def get_cuda_arch_versions():
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
 
+# <NT> 主入口，外部使用一般直接调用该接口。
+# 通过arch派发kernel, 主要实现了qk:int8, pv:fp8/fp16
+# tensor_layout有HND和NHD两种选择，flashinfer/fa3里都是NHD，而这里默认是HND.
 def sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -742,6 +745,39 @@ def sageattn_qk_int8_pv_fp8_cuda(
     else:
         return o
 
+# <NT>M 从sageattn接口进入，基于sm90会直接派发该函数，进而进入到qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf中。
+# 该kernel的qk输入是int8，v输入是fp8，acc是fp32.
+# bench_qk_int8_pv_fp8_cuda_sm90.py中选用的kernel是qk_int8_sv_f8_accum_f32_attn_inst_buf。
+# 区别在于是否fuse_v_scale，这里的v_scale会提前算好作为参数输入。
+#
+# 步骤：
+# 1) 类型检查: 输入的qkv都需要是bf16或fp16的。
+# 2）补pad: qkv的head_dim应相同，不足64的会在head_dim维度(即最后一维)补零到64，不足128的会补零到128
+# 3）执行smooth_k：对k在seq_len的维度上取均值，keepdim=True 表示结果张量的形状将与原张量 k 相同，只是在 seq_dim 维度上变成了1。
+# 4）对qkv进行在线量化.
+# 6）调用 qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf 派发 qk_int8_sv_f8_attn_kernel(纯cuda) 完成attention计算，输出o是bf16/fp16格式。
+#
+# 量化类型: q和k可选per_warp和per_thread，从bf16/fp16->int8; v采用per_channel, 从bf16/fp16->fp8.
+# kernel类型: 1) sm80: sageattn_qk_int8_pv_fp16_cuda
+#             2) sm86: sageattn_qk_int8_pv_fp16_triton
+#             3) sm89: sageattn_qk_int8_pv_fp8_cuda
+#             4) sm90: sageattn_qk_int8_pv_fp8_cuda_sm90
+#             5) sm120: sageattn_qk_int8_pv_fp8_cuda
+# mma计算类型: qk 采用s8->s32, 转为fp8或fp16，与对应类型的v 计算fp8/fp16->fp32.
+# 
+# <NT>M 相比于fa3的限制条件:
+# 1) 采用固定fp16/bf16输入，而后函数内部会根据派发的kernel添加在线量化函数，将数据量化到int8。
+#    即：1.对于访存受限的decode阶段，在线量化代价大，难以取得收益。因此sageattention多用于prefill。
+#        2.如需绕过在线量化，内层接口仅支持int8的qk，难以满足条件。（benchmark以内层int8的接口进行，如加上在线量化部分，则性能会大打折扣）
+# 2）qkv的head_dim需一致，则mla无法支持。
+# 3）head_dim最大支持到128，fa3等无此限制要求。
+# 4）不支持输入page_table. fa3 kernel中可以输入完整的kvcache，然后从table中动态加载对应kvcache。否则只能在kernel外进行做kvcache的选取，无法充分发挥kernel性能。
+# 5）sm89 api疑似有内存问题：基于python/sglang/srt/layers/attention/torch_native_backend.py对scaled_dot_product_attention进行直接替换，开始几帧数据时常能与torch对齐，但后面的数据容易出现nan。
+#                且在不替换scaled_dot_product_attention的情况下，将相同的输入喂给sageattn，输出不固定。个别输出结果一致，个别输出结果错乱，且每次执行有一定随机性。
+#    相比于fa3的优势：
+# 1）在线量化能更好地保持模型的精度。
+# 2）输入输出都是bf16/fp16，可实现即插即用。
+# 3）接口与 torch.nn.functional.scaled_dot_product_attention 高度相似，容易对应替换。
 @torch.compiler.disable
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
     q: torch.Tensor, 

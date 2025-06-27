@@ -26,6 +26,8 @@
 
 #include "attn_utils.cuh"
 
+// <NT> 创建一个 4 维张量映射，通过 cuTensorMapEncodeTiled 将全局内存中的张量映射到共享内存中的块。
+// 用于高效地管理张量（多维数组）的内存访问，内存布局是 d1-d4 [batch_size, nhead, seq_len, head_dim]. gmem_prob_shapep[head_dim, seq_len, nhead, batch_size]
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, CUtensorMapL2promotion_enum promotion_mode=CU_TENSOR_MAP_L2_PROMOTION_NONE, typename T>
 CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int stride1, int stride2, int stride3) {
     constexpr int smem_stride = BlockMinorSize * sizeof(T);
@@ -50,6 +52,8 @@ CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, in
     return tma_map;
 }
 
+// <NT> __cvta_generic_to_shared将通用指针bar转换为共享内存地址. 
+// CUDA的内存模型中，不同类型的内存(gmem、smem等)有不同的地址空间.
 __device__ __forceinline__ void init_barrier(uint64_t* bar, int thread_count) {
     uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
     asm volatile (
@@ -58,6 +62,8 @@ __device__ __forceinline__ void init_barrier(uint64_t* bar, int thread_count) {
     );
 }
 
+// <NT> 确保在指定的共享内存地址bar处，预期的字节数bytes已经准备好.
+// 用于多线程或线程块之间的协调，确保在继续执行之前，所有相关的数据都已经写入共享内存。
 template <uint32_t bytes>
 __device__ __forceinline__ void expect_bytes(uint64_t* bar) {
     uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
@@ -65,6 +71,7 @@ __device__ __forceinline__ void expect_bytes(uint64_t* bar) {
         :: "r"(bar_ptr), "n"(bytes));
 }
 
+// <NT> src_tma_map是函数create_tensor_map_4D的返回值，dst是共享内存，通过map将数据从gmem转到smem
 template <typename T>
 __device__ __forceinline__ void load_async_4D(T *dst, void const* const src_tma_map, uint64_t* bar, int s0, int s1, int s2, int s3) {
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
@@ -96,6 +103,11 @@ __device__ __forceinline__ void store_async_4D(void const* dst_tma_map, T *src, 
     );
 }
 
+// <NT> mbarrier.try_wait.parity.shared::cta.b64 尝试等待内存屏障，直到满足特定条件
+// P1 结果存储在布尔寄存器P1中, @P1 bra.uni DONE如果P1为真（即内存屏障条件满足），则无条件跳转到DONE标签。
+// bra.uni LAB_WAIT;：如果P1为假（即内存屏障条件不满足），则无条件跳转回LAB_WAIT标签，继续等待
+// kPhaseBit 指定内存屏障的阶段，可以是一个位掩码，用于指定当前线程或线程块需要等待的特定阶段。
+// 该wait函数与expect_bytes搭配使用, expect_bytes表示希望数据送达，wait是等待这个希望完成。
 __device__ __forceinline__ void wait(uint64_t* bar, int kPhaseBit) {
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar)); 
     asm volatile (
@@ -123,6 +135,18 @@ __device__ __forceinline__ void arrive(uint64_t* bar) {
     );
 }
 
+// <NT> sm90的attention计算cuda kernel (非cutlass)，qk为int8，v为fp8.
+// 调用链路：sageattn "sm90"派发 
+//          -> sageattn_qk_int8_pv_fp8_cuda_sm90 
+//             -> qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf 
+//                -> qk_int8_sv_f8_attn_kernel
+// launch参数: grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size)，CTA_Q是一个block处理的Q维度数量，q总长除以CTA_Q表示Q维度上所需的block数量。
+//             加上num_qo_heads和batch_size，组成一个三维的grid。而block是一维128个线程。
+// CTA_Q 表示一个block需要处理的q的维度(固定为64)， CTA_K表示一个block需要处理的k的维度(固定为128)；
+// Q_GRAN和K_GRAN通常一致，取per_warp和per_thread两种量化方案，见sageattn_qk_int8_pv_fp8_cuda_sm90；
+// DTypeOut是bf16或fp16；mask_mode只取是否有因果mask；return_lse通常为false；由接口sageattn进入该函数，则fuse_v_scale为true。
+// sm_scale: 如未提供，则取head_dim_og**-0.5，即1/根号(head_dim), 用于缩放点积，以防止在计算 softmax 时数值过大导致的数值不稳定。
+//           围绕head_dim进行，是因为稳定性与head_dim大小有关，head_dim较大，那么点积的结果可能会非常大。
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeOut, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false>
 __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap tensorMapQ, 
                                         const __grid_constant__ CUtensorMap tensorMapK,
@@ -138,6 +162,10 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   const uint32_t warp_idx = (threadIdx.x % 128) / 32;
   const uint32_t lane_id = threadIdx.x % 32;
 
+  // <NT> 一个block内切分的tile，CTA_Q为64，即Q维度上不再做切分，CTA_K为128则一个block内k维度会分8个tile来处理, head_dim为64或128.
+  // 所以有: 
+  // num_tiles_q=1,      num_tiles_k=8,         num_tiles_qk_inner=2/4
+  // num_tiles_v=4/8,    num_tiles_pv_inner=4
   constexpr uint32_t num_tiles_q = CTA_Q / 64;
   constexpr uint32_t num_tiles_k = CTA_K / 16;
   constexpr uint32_t num_tiles_qk_inner = head_dim / 32;
@@ -150,15 +178,22 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t kv_head_id = head_id / num_kv_groups;
 
+  // <NT> 将缩放因子从自然对数空间转换到以 2 为底的对数空间。
+  // 后续会直接跟dequant_scale相乘。
   sm_scale *= math::log2e;
 
   extern __shared__ __align__(128) int8_t smem_[];
 
+  // <NT> sQ[CTA_Q, head_dim], sK[CTA_K, head_dim], sV[head_dim, CTA_K]]
+  // sQ*sKt=P[CTA_Q, CTA_K], P*sV=O[CTA_Q, head_dim]
   int8_t *sQ = (int8_t*)smem_;
   int8_t *sK = (int8_t*)(smem_ + CTA_Q * head_dim * sizeof(int8_t));
   int8_t *sV = (int8_t*)(smem_ + CTA_Q * head_dim * sizeof(int8_t) + CTA_K * head_dim * sizeof(int8_t));
   half *sO = (half*)smem_;
 
+  // <NT> 针对wgmma的指令分块，指令取m64n128k32 或 m64n128k32，而一个block涵盖的数据会包含多个指令tile。
+  // 所以一个block有多少个指令tile，这里就分多少个元素。
+  // RS类型是int32_t，因为是QK的mma是s8*s8=s32；RO取float，因为PV的mma是f8*f8=f32.
   int32_t RS[num_tiles_q][num_tiles_k][8];
   float RO[num_tiles_q][num_tiles_v][8];
   float m[num_tiles_q][2];
@@ -232,6 +267,24 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
   __syncthreads();
 
+  // <NT> 同时发起qkv的tma异步拷贝指令，一个block使用一个线程发起。
+  // expect_bytes是预期该barrier会有相应的字节数会送达，wait来等待该送达完成。
+  // load_async_4D中gmem_prob_shapep[head_dim, seq_len, nhead, batch_size]
+  // bx = blockIdx.x;  head_id = blockIdx.y; batch_id = blockIdx.z;  kv_head_id转自head_id
+  // 
+  // Q：block的xyz涉及到了Q的seq_len / nhead / batch_size，即一次会被全部取出进行计算，
+  // 只有head_dim未涉及到，而head_dim最多只有128, 在一个block范围内，
+  // 所以Q的读取是在load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, bx * CTA_Q, head_id, batch_id);一次可完整取出。
+  // K: block的yz涉及到了kv_head_id / batch_id，第一维的head_dim同理也在一个block内，剩余seq_len的维度未能完整取出。
+  //    即下面的for循环迭代中，需要依次读取seq_len维度上的块，进行分块处理。
+  // V：与K类似。
+  // 所以一个block需要负责Q的一个tile，并循环取KV在seq_len维度的多个tile的计算。
+  // load Q
+  // load K0，V0
+  // for：
+  //    mma(mma(Q,Ki), Vi)
+  //    load Ki+1, Vi+1
+  //
   // load Q, K, V
   if (threadIdx.x == 0)
   {
@@ -246,6 +299,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   float q_scale = Q_scale[q_scale_idx];
   float original_sm_scale = sm_scale;
 
+  // <NT> wait后sQ已到位, 可以开始for循环多个KV块的计算。
   // wait for Q
   wait(&barrier_Q, 0);
 
@@ -258,6 +312,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   int p = 1;
   for (uint32_t iter = 1; iter < num_iterations; iter++)
   { 
+    // <NT> 区分奇数偶数，1=0^1, 0=1^1，确保对应数据都在同一barrier阶段
     p ^= 1;
 
     float dequant_scale = q_scale * K_scale[k_scale_idx + (iter - 1) * k_scale_advance_offset];
@@ -269,19 +324,24 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     // compute QK^T
     wgmma::warpgroup_arrive();
 #pragma unroll
+    // <NT> num_tiles_q为1，该block的该维度刚好是64，不需要针对wgmma再切分。
     for (uint32_t fq = 0; fq < num_tiles_q; fq++)
     {
       int8_t *sQ_local = sQ + fq * 64 * head_dim;
       wgmma::wgmma_s8s8s32<CTA_K, 0, head_dim>(RS[fq], sQ_local, sK);
 #pragma unroll
+      // <NT> num_tiles_qk_inner是2或4。因为head_dim是64或128，Q[CTA_Q, head_dim] * K[CTQ_K, head_dim]，
+      // 所以是head_dim充当mma的k，wgmma_s8s8s32内用的是m64n128k32 或 m64n128k32， k取32，需要按k继续分块。
       for (int k_it = 1; k_it < num_tiles_qk_inner; k_it++)
       {
         wgmma::wgmma_s8s8s32<CTA_K, 1, head_dim>(RS[fq], &sQ_local[k_it*32], &sK[k_it*32]);
       }
     }
+    // <NT> 提交和同步wg
     wgmma::warpgroup_commit_batch();
     wgmma::warpgroup_wait<0>();
 
+    // <NT> 该轮计算结束，开始预取K的seq_len方向的下一个Tile数据。
     // load K
     if (threadIdx.x == 0)
     {
@@ -289,6 +349,9 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       load_async_4D(sK, &tensorMapK, &barrier_K, 0, iter * CTA_K, kv_head_id, batch_id);
     }
 
+    // <NT> RS是QK^T的指令分块计算结果，将其通过__int2float_rz转为fp32。
+    // 开始进入online softmax计算的环节。RS_f32是[8,8], 对应一个线程的数据，
+    // 一个wg是128个线程，对应一次wgmma的m64n128k32的结果[64,128].
     // convert RS to float
     float RS_f32[num_tiles_q][num_tiles_k][8];
 #pragma unroll
@@ -305,6 +368,11 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       }
     }
 
+    // <NT> 每个线程基于新的QKt输出RS_f32[8,8]，以及历史的 m / d / RO, 共同计算online softmax。
+    // 包含 最大值更新；指数和更新；attention out更新；
+    // RO: PV结果的累加值
+    // m: 最大值，对应fa3中的max_get_scale函数的row_max
+    // d: 指数和，对应fa3中的max_get_scale函数的row_sum
     update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
 
     // accumulate d on thread basis
@@ -319,6 +387,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       }
     }
 
+    // <NT> 将fp32的RS转为fp8，准备进入PV的计算。
     uint32_t RS_f8[num_tiles_q][num_tiles_pv_inner][4];
     RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
@@ -355,6 +424,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       }
     }
 
+    // <NT> 这一轮V计算完，马上开始下一轮V的读取
     // load V
     if (threadIdx.x == 0)
     {
