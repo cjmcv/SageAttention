@@ -61,6 +61,11 @@ __device__ __forceinline__ T convert_from_float(float val)
   }
 }
 
+// <NT> per_block和pre_warp都调用该kernel进行量化，其中per_block有has_sm_scale（转换过程中会多乘以sm_scale）；
+// BLOCK_SIZE是正常的BLOCK_SIZE，而pre_warp的是WARP_BLOCK_SIZE，可以理解成pre_warp量化是blocksize为32的per_block量化。
+// num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+// 如q的per_warp: 1 = (32 * 128 / 8 + 1023) / 1024; 
+//  k的per_block: 2 = (64 * 128 / 8 + 1023) / 1024；
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, bool has_sm_scale = false, bool sub_mean = false, typename T>
 __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int8_t *__restrict__ output, float *__restrict__ scale, float sm_scale, const uint32_t num_tokens, 
                             const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
@@ -68,14 +73,18 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
                             const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output,
                             const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
 {
+  // <NT> 输入类型仅为fp16和bf16，将其量化成int8类型。
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
   static_assert(num_pack_per_thread > 0, "The number of pack per thread must be greater than 0");
 
+  // <NT> 合并访问，后续都按float4进行处理，即128位，共8个fp16/bf16。
+  // 则一个线程一次处理8个数据，由head_dim/8得到一个token(即head_dim长度)所需要的线程数。
   constexpr uint32_t pack_size = 8; // float4 contains 8 half or 8 bfloat16
   constexpr uint32_t num_threads_per_token = head_dim / pack_size;
 
   static_assert(num_threads_per_token <= 32, "The number of threads per token must be less than or equal to warp size");
 
+  // <NT> num_pack_per_thread的per_warp是1，per_block是2.
   T x_val[num_pack_per_thread][8];
   T mean_val[8];
   float x_val_float[num_pack_per_thread][8];
@@ -92,6 +101,7 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
   int8_t *output_ptr_base = output + batch_id * stride_bz_output + head_id * stride_h_output + thread_base_token * stride_seq_output + thread_id % num_threads_per_token * pack_size;
   float *scale_ptr_base = scale + batch_id * stride_bz_scale + head_id * stride_h_scale + bx;
 
+  // <NT> q不减，k在使用smooth_k时需要减去均值，这里先转为浮点。
   if constexpr (sub_mean)
   {
     *(float4*)(&mean_val[0]) = *(float4*)(mean_ptr_base);
@@ -102,6 +112,7 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
     }
   }
 
+  // <NT> 按BLOCK_SIZE计算迭代步长，per_warp是32=32/1，per_block是32=64/2；
   constexpr uint32_t iter_stride = BLOCK_SIZE / num_pack_per_thread;
 
   // load the data

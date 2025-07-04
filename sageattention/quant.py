@@ -17,7 +17,7 @@ limitations under the License.
 import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
-from . import _fused
+# from . import _fused
 
 def per_block_int8(
     q: torch.Tensor, 
@@ -92,7 +92,7 @@ def per_block_int8(
         sm_scale = head_dim**-0.5
     
     sm_scale *= 1.44269504
-
+    from . import _fused
     _fused.quant_per_block_int8_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
     if km is not None:
         km = km.squeeze(1) if _tensor_layout == 0 else km.squeeze(2)
@@ -111,6 +111,12 @@ def per_warp_int8(
     BLKK: int =64,
     tensor_layout: str ="HND"
 ):
+    # <NT> 如per_token量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, qo_len]
+    # 实际 q是per_warp量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, (qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ)]
+    #                                                                约 => [batch_size, num_qo_heads, (qo_len // 32)]
+    #     k是per_block量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, (kv_len + BLKK - 1) // BLKK]
+    #                                                                约 => [batch_size, num_kv_heads, (kv_len // 64)]
+    # 即per_warp和per_block是在per_token的基础上，加粗颗粒度，分别让32个token和64个token共用一组scale。
     """
     Quantize the query tensor `q` with per warp quantization and the key tensor `k` with per block quantization.
     Warp size of quantizing `q` is 16 or 32, with a block size of 64 or 128.
@@ -168,7 +174,7 @@ def per_warp_int8(
 
     q_scale = torch.empty((b, h_qo, ((qo_len + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ)), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
-
+    from . import _fused
     _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, BLKQ, WARPQ, _tensor_layout)
 
     if km is not None:
@@ -217,6 +223,7 @@ def sub_mean(
     v_smoothed = torch.empty(v.shape, dtype=torch.float16, device=v.device)
     
     # subtract mean and store the result as fp16
+    from . import _fused
     _fused.sub_mean_cuda(v, vm, v_smoothed, _tensor_layout)
 
     return v_smoothed, vm
@@ -227,6 +234,8 @@ def per_channel_fp8(
     scale_max: float = 448.0,
     smooth_v: bool = True
 ):
+    # <NT>   如per_token量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, kv_len]
+    # 实际 v是per_channel量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, head_dim]
     """
     Transpose, pad and permute the tensor `v` and quantize it to fp8 with per channel quantization.
     `v` is first transposed along the head dimension and the sequence length dimension, then padded to a multiple of 64.
@@ -277,7 +286,7 @@ def per_channel_fp8(
         b, kv_len, h_kv, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64
         v_transposed_permutted = torch.empty((b, head_dim, h_kv, padded_len), dtype=v.dtype, device=v.device)
-    
+    from . import _fused
     _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)
 
     v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)

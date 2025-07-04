@@ -151,6 +151,13 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
+# <NT>   如per_token量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, qo_len]
+# 实际 q的per_thread量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, (qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8)]
+#                                                                  约 => [batch_size, num_qo_heads, (qo_len // 4)] 对比 per_warp的[batch_size, num_qo_heads, (qo_len // 32)]
+#                                                                  颗粒度比per_warp细8倍。
+#     k是per_block量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, (kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4)]
+#                                                                约 => [batch_size, num_kv_heads, kv_len // 16] 对比 per_block的[batch_size, num_kv_heads, (kv_len // 64)]
+#                                                                  颗粒度比per_warp细4倍。
 def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_scale=None, tensor_layout="HND"):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
