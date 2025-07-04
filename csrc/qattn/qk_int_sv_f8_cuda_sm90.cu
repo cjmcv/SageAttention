@@ -147,6 +147,9 @@ __device__ __forceinline__ void arrive(uint64_t* bar) {
 // DTypeOut是bf16或fp16；mask_mode只取是否有因果mask；return_lse通常为false；由接口sageattn进入该函数，则fuse_v_scale为true。
 // sm_scale: 如未提供，则取head_dim_og**-0.5，即1/根号(head_dim), 用于缩放点积，以防止在计算 softmax 时数值过大导致的数值不稳定。
 //           围绕head_dim进行，是因为稳定性与head_dim大小有关，head_dim较大，那么点积的结果可能会非常大。
+// 
+// 步骤归纳：
+// 1. 
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeOut, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false>
 __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap tensorMapQ, 
                                         const __grid_constant__ CUtensorMap tensorMapK,

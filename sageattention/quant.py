@@ -111,6 +111,12 @@ def per_warp_int8(
     BLKK: int =64,
     tensor_layout: str ="HND"
 ):
+    # <NT> 如per_token量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, qo_len]
+    # 实际 q是per_warp量化，[batch_size, num_qo_heads, qo_len, head_dim] -> [batch_size, num_qo_heads, (qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ)]
+    #                                                                约 => [batch_size, num_qo_heads, (qo_len // 32)]
+    #     k是per_block量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, (kv_len + BLKK - 1) // BLKK]
+    #                                                                约 => [batch_size, num_kv_heads, (kv_len // 64)]
+    # 即per_warp和per_block是在per_token的基础上，加粗颗粒度，分别让32个token和64个token共用一组scale。
     """
     Quantize the query tensor `q` with per warp quantization and the key tensor `k` with per block quantization.
     Warp size of quantizing `q` is 16 or 32, with a block size of 64 or 128.
@@ -228,6 +234,8 @@ def per_channel_fp8(
     scale_max: float = 448.0,
     smooth_v: bool = True
 ):
+    # <NT>   如per_token量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, kv_len]
+    # 实际 v是per_channel量化，[batch_size, num_kv_heads, kv_len, head_dim] -> [batch_size, num_kv_heads, head_dim]
     """
     Transpose, pad and permute the tensor `v` and quantize it to fp8 with per channel quantization.
     `v` is first transposed along the head dimension and the sequence length dimension, then padded to a multiple of 64.
